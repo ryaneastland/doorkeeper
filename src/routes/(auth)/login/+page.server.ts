@@ -1,4 +1,4 @@
-import { fail, redirect, type ActionFailure } from '@sveltejs/kit';
+import { fail, redirect, isRedirect, type ActionFailure } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
 import type { Actions } from './$types';
 import { AuthApiError } from '@supabase/supabase-js';
@@ -27,6 +27,8 @@ export const actions = {
 					throw new Error('No session created');
 				}
 			} catch (error) {
+				// redirect() works by throwing; let the success redirect through
+				if (isRedirect(error)) throw error;
 				return failWithAuthError(
 					error,
 					'signinWithPassword',

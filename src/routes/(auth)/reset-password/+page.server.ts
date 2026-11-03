@@ -1,4 +1,4 @@
-import { redirect, fail } from '@sveltejs/kit';
+import { redirect, fail, isRedirect } from '@sveltejs/kit';
 import type { Actions } from './$types';
 import { AuthApiError } from '@supabase/supabase-js';
 import { failWithAuthError } from '$lib/utils/authErrorHandler';
@@ -45,6 +45,8 @@ export const actions = {
 			// Success - redirect to confirmation page
 			redirect(303, '/email-confirm');
 		} catch (error) {
+			// redirect() works by throwing; let the success redirect through
+			if (isRedirect(error)) throw error;
 			return failWithAuthError(
 				error, 
 				'resetPassword', 
