@@ -1,7 +1,8 @@
 import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
 import { createClient } from '@supabase/supabase-js';
 import type { Actions, PageServerLoad } from './$types';
-import { PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_SERVICE_KEY } from '$env/static/public';
+import { PUBLIC_SUPABASE_URL } from '$env/static/public';
+import { PRIVATE_SUPABASE_SERVICE_KEY } from '$env/static/private';
 import { supabase } from '$lib/supabaseClient';
 
 export const load = (async ({ locals: { getSession } }) => {
@@ -10,11 +11,11 @@ export const load = (async ({ locals: { getSession } }) => {
 		throw redirect(303, '/');
 	}
 
-	if (!PUBLIC_SUPABASE_URL || !PUBLIC_SUPABASE_SERVICE_KEY) {
+	if (!PUBLIC_SUPABASE_URL || !PRIVATE_SUPABASE_SERVICE_KEY) {
 		return { users: [], error: 'Supabase configuration missing' };
 	}
 
-	const supabaseAdmin = createClient(PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_SERVICE_KEY);
+	const supabaseAdmin = createClient(PUBLIC_SUPABASE_URL, PRIVATE_SUPABASE_SERVICE_KEY);
 
 	// Fetch profiles from public schema
 	const { data: profiles, error: profilesError } = await supabase
@@ -89,7 +90,7 @@ export const actions: Actions = {
 			return fail(400, { message: 'You cannot delete yourself' });
 		}
 
-		const supabaseAdmin = createClient(PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_SERVICE_KEY);
+		const supabaseAdmin = createClient(PUBLIC_SUPABASE_URL, PRIVATE_SUPABASE_SERVICE_KEY);
 
 		// Delete from auth.users (cascade should handle profiles if configured,
 		// but we'll do both to be safe or if no cascade exists)
