@@ -2,7 +2,9 @@
 // can run the identical proximity maths. The client copy is UX only — the server copy is the
 // one that gates the door.
 
-import { PUBLIC_SITE_MAX_ACCURACY_METRES, PUBLIC_SITE_RADIUS_METRES } from '$env/static/public';
+// Read at runtime ($env/dynamic) so these stay optional: a missing var falls back to a default
+// instead of failing the build.
+import { env } from '$env/dynamic/public';
 
 /** Falls back when the variable is unset, empty or non-numeric, so a bad value can't widen the fence. */
 function metresFromEnv(value: string | undefined, fallback: number): number {
@@ -11,10 +13,19 @@ function metresFromEnv(value: string | undefined, fallback: number): number {
 }
 
 /** How far from the site a reported position may be and still open a door. */
-export const SITE_MAX_DISTANCE_METRES = metresFromEnv(PUBLIC_SITE_RADIUS_METRES, 300);
+export const SITE_MAX_DISTANCE_METRES = metresFromEnv(env.PUBLIC_SITE_RADIUS_METRES, 300);
 
 /** Reject positions vaguer than this — a 5 km accuracy radius proves nothing. */
-export const MAX_LOCATION_ACCURACY_METRES = metresFromEnv(PUBLIC_SITE_MAX_ACCURACY_METRES, 100);
+export const MAX_LOCATION_ACCURACY_METRES = metresFromEnv(env.PUBLIC_SITE_MAX_ACCURACY_METRES, 100);
+
+/** Shown in location messages and the page heading. */
+export const SITE_NAME = env.PUBLIC_SITE_NAME || 'Moorooduc Fire Station';
+
+/**
+ * Turns the proximity check off entirely — for local development only. It must be switched off
+ * explicitly: unset or unrecognised values keep the geofence on.
+ */
+export const GEOFENCE_DISABLED = env.PUBLIC_GEOFENCE_DISABLED === 'true';
 
 /** ~200 km/h. Faster than any road approach to the station. */
 export const MAX_PLAUSIBLE_SPEED_MPS = 55;

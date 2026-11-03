@@ -1,27 +1,31 @@
-import { fail, redirect, type Actions, type RequestEvent } from '@sveltejs/kit';
+import { fail, redirect } from '@sveltejs/kit';
 import type { Session } from '@supabase/supabase-js';
-import { authenticate, getToken } from '$lib/services/inceptionAuthService';
 import {
+	GEOFENCE_DISABLED,
 	MAX_LOCATION_ACCURACY_METRES,
 	MAX_PLAUSIBLE_SPEED_MPS,
 	MIN_JUMP_DISTANCE_METRES,
 	SITE_MAX_DISTANCE_METRES,
+	SITE_NAME,
 	calculateDistance
 } from '$lib/common/geo';
-import type { PageServerLoad } from '../$types';
-import { PRIVATE_INCEPTION_BASE_URL } from '$env/static/private';
-import { PUBLIC_SITE_LATITUDE, PUBLIC_SITE_LONGITUDE } from '$env/static/public';
+import { getDoorProvider } from '$lib/server/doors';
 import { supabase } from '$lib/supabaseClient';
+import { PUBLIC_SITE_LATITUDE, PUBLIC_SITE_LONGITUDE } from '$env/static/public';
+import type { Actions, PageServerLoad } from './$types';
 
 export const load = (async ({ locals: { getSession } }) => {
 	const session = await getSession();
 	if (!session) {
 		redirect(302, '/login');
 	}
-	return {};
-}) satisfies PageServerLoad;
 
-const baseUrl = PRIVATE_INCEPTION_BASE_URL;
+	const provider = await getDoorProvider();
+	return {
+		doors: provider.doors.map(({ id, name, icon }) => ({ id, name, icon, locked: null })),
+		capabilities: provider.capabilities
+	};
+}) satisfies PageServerLoad;
 
 const siteLocation = {
 	latitude: Number(PUBLIC_SITE_LATITUDE),
@@ -35,10 +39,9 @@ interface PositionReport {
 }
 
 /**
- * The last position each user claimed, kept for the implausible-travel check. Module-level like
- * the Inception token cache, so it is best-effort only: it is empty after a cold start and is not
- * shared between concurrent serverless instances. Treat a pass here as "not obviously forged",
- * never as proof of presence.
+ * The last position each user claimed, kept for the implausible-travel check. Module-level, so it
+ * is best-effort only: it is empty after a cold start and is not shared between concurrent
+ * serverless instances. Treat a pass here as "not obviously forged", never as proof of presence.
  */
 const lastReportedPosition = new Map<string, PositionReport>();
 
@@ -51,6 +54,10 @@ type LocationCheck = { ok: true } | { ok: false; reason: string };
  * caller is on site.
  */
 function checkReportedLocation(userId: string, formData: FormData): LocationCheck {
+	if (GEOFENCE_DISABLED) {
+		return { ok: true };
+	}
+
 	const latitude = Number(formData.get('latitude'));
 	const longitude = Number(formData.get('longitude'));
 	const accuracy = Number(formData.get('accuracy'));
@@ -69,8 +76,7 @@ function checkReportedLocation(userId: string, formData: FormData): LocationChec
 	if (!Number.isFinite(accuracy) || accuracy <= 0 || accuracy > MAX_LOCATION_ACCURACY_METRES) {
 		return {
 			ok: false,
-			reason:
-				'Your location is not accurate enough to confirm you are at the station. Move outside and try again.'
+			reason: `Your location is not accurate enough to confirm you are at ${SITE_NAME}. Move outside and try again.`
 		};
 	}
 
@@ -99,7 +105,7 @@ function checkReportedLocation(userId: string, formData: FormData): LocationChec
 	);
 
 	if (distance > SITE_MAX_DISTANCE_METRES) {
-		return { ok: false, reason: 'You are not within range of Moorooduc Fire Station.' };
+		return { ok: false, reason: `You are not within range of ${SITE_NAME}.` };
 	}
 
 	return { ok: true };
@@ -121,81 +127,59 @@ async function logEntry(session: Session, doorId: string, doorName: string, stat
 	return !error;
 }
 
-async function controlDoor(id: string, token: string) {
-	const url = `${baseUrl}/api/v1/control/door/${id}/activity`;
-	const body = {
-		Type: 'ControlDoor',
-		DoorControlType: 'Open',
-		Entity: id
-	};
-
-	try {
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Cookie: `LoginSessId=${token}`
-			},
-			body: JSON.stringify(body)
-		});
-
-		if (!response.ok) {
-			const errorText = await response.text();
-			console.error('Failed to control the door:', response.status, response.statusText, errorText);
-			throw new Error(`Failed to control the door: ${response.statusText}`);
-		}
-
-		const data = await response.json();
-		return data;
-	} catch (error) {
-		console.error('Error in controlDoor:', error);
-		throw error;
-	}
-}
-
-export const actions: Actions = {
-	control: async ({ request, locals: { getSession } }: RequestEvent) => {
+export const actions = {
+	control: async ({ request, locals: { getSession } }) => {
 		const session = await getSession();
 		if (!session) {
-			throw redirect(302, '/login');
+			redirect(302, '/login');
 		}
 
 		const formData = await request.formData();
-		const doorId = formData.get('doorId') as string;
-		const doorName = formData.get('doorName') as string; // Ensure the door name is also sent
+		const provider = await getDoorProvider();
+		// Look the door up server-side: never trust a door name or target posted by the client.
+		const door = provider.doors.find((d) => d.id === formData.get('doorId'));
+		if (!door) {
+			return fail(400, { success: false, error: 'Unknown door' });
+		}
 
 		const locationCheck = checkReportedLocation(session.user.id, formData);
 		if (!locationCheck.ok) {
 			console.warn(`Door open denied for ${session.user.email}: ${locationCheck.reason}`);
-			await logEntry(session, doorId, doorName, false);
+			await logEntry(session, door.id, door.name, false);
 			return fail(403, { success: false, error: locationCheck.reason });
 		}
 
-		let token = getToken();
-		if (!token) {
-			token = await authenticate();
+		const result = await provider.open(door);
+
+		if (!result.ok) {
+			console.error(`Failed to open ${door.name}:`, result.error);
+			await logEntry(session, door.id, door.name, false);
+			return fail(502, { success: false, error: result.error ?? 'Failed to open the door' });
 		}
 
-		if (!token) {
-			return fail(502, { success: false, error: 'Failed to obtain authentication token' });
+		if (!(await logEntry(session, door.id, door.name, true))) {
+			return fail(500, { success: false, error: 'Door opened, but the entry could not be logged' });
 		}
 
-		try {
-			const result = await controlDoor(doorId, token);
+		return { success: true, disarmedCount: result.disarmedCount ?? 0 };
+	},
 
-			// Insert a record into the Supabase entry_logs table
-			if (!(await logEntry(session, doorId, doorName, true))) {
-				return fail(500, { success: false, error: 'Failed to log entry' });
-			}
-
-			return { success: true, result };
-		} catch (error) {
-			console.error('Failed to execute control action:', error);
-
-			// Insert a record into the Supabase entry_logs table with status false
-			await logEntry(session, doorId, doorName, false);
-
-			return fail(502, { success: false, error: (error as Error).message });
+	arm: async ({ locals: { getSession } }) => {
+		const session = await getSession();
+		if (!session) {
+			redirect(302, '/login');
 		}
+
+		const provider = await getDoorProvider();
+		if (!provider.arm) {
+			return fail(404, { success: false, error: 'This site does not support arming' });
+		}
+
+		const result = await provider.arm();
+		await logEntry(session, 'arm', 'ARM SITE', result.ok);
+
+		return result.ok
+			? { success: true }
+			: fail(502, { success: false, error: result.error ?? 'Arm failed (a zone may be open)' });
 	}
-};
+} satisfies Actions;

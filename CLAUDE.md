@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DoorKeeper is a SvelteKit 2 / Svelte 4 app that wraps the Inner Range Inception (SkyCommand) API to give brigade members a simple door-opening UI. Supabase provides auth (email/password + OTP, PKCE flow for SSR) and stores profiles and audit logs. It deploys to Netlify.
+DoorKeeper is a SvelteKit 2 / Svelte 4 app that gives brigade members a simple door-opening UI over an alarm/access panel. The panel backend is a pluggable **door provider** (`DOOR_PROVIDER`): `inner-range` (default — the Inner Range Inception / SkyCommand REST API, deploys serverless to Netlify) or `bosch` (Bosch Solution panels via the myAlarm UDP protocol, needs one persistent Node server — see `docs/BOSCH-INTEGRATION.md`). Supabase provides auth (email/password + OTP, PKCE flow for SSR) and stores profiles and audit logs.
 
 ## Commands
 
@@ -27,19 +27,28 @@ See `AGENTS.md` for the code style contract (tabs, single quotes, no trailing co
 ```bash
 PUBLIC_SUPABASE_URL
 PUBLIC_SUPABASE_ANON_KEY
-PUBLIC_SUPABASE_SERVICE_KEY     # service role key — see warning below
+PRIVATE_SUPABASE_SERVICE_KEY    # service role key — server-only ($env/static/private)
+PUBLIC_SITE_NAME                # shown in the heading and location messages (default Moorooduc Fire Station)
 PUBLIC_SITE_LATITUDE            # site coords for the proximity check
 PUBLIC_SITE_LONGITUDE
 PUBLIC_SITE_RADIUS_METRES       # geofence radius, defaults to 300 if unset-but-invalid
 PUBLIC_SITE_MAX_ACCURACY_METRES # reject vaguer fixes than this, defaults to 100
+PUBLIC_GEOFENCE_DISABLED        # 'true' skips the proximity check — local dev only
 
-PRIVATE_INCEPTION_USERNAME
+DOOR_PROVIDER                   # inner-range (default) | bosch
+ADAPTER                         # optional build override: netlify | node (default follows DOOR_PROVIDER)
+DOORS                           # JSON door list; optional for inner-range, required for bosch
+
+PRIVATE_INCEPTION_USERNAME      # inner-range
 PRIVATE_INCEPTION_PASSWORD
-PRIVATE_INCEPTION_SERIAL
 PRIVATE_INCEPTION_BASE_URL      # e.g. https://skytunnel.com.au/inception/<serial>
+
+BOSCH_HOST BOSCH_PORT BOSCH_SERIAL BOSCH_APPCODE BOSCH_DEVICEID BOSCH_USERPIN   # bosch
 ```
 
-⚠️ The Supabase **service role key is stored under a `PUBLIC_` prefix**, so Vite inlines it and it is reachable from client bundles. It is currently read in `serviceSupabase.ts`, `(admin)/admin/invite`, and `(admin)/admin/users`. Do not add new `PUBLIC_SUPABASE_SERVICE_KEY` usages; if you touch this area, migrate it to `$env/static/private` (`PRIVATE_SUPABASE_SERVICE_KEY`) rather than propagating the pattern.
+`.env.example` lists them all with comments. The site, geo and provider vars are read via `$env/dynamic/*`, so they are optional at build time; a Bosch build does not need the Inception vars and vice versa.
+
+⚠️ The Supabase service role key must stay `PRIVATE_`: a `PUBLIC_` var is inlined into client bundles. Never hard-code panel credentials (serial, PIN, app code) anywhere — the repo is public; scripts read them from `.env`.
 
 ## Architecture
 
@@ -49,7 +58,7 @@ This is the single most important thing to understand before editing server code
 
 1. **`locals.supabase`** — created per-request in `src/hooks.server.ts` via `createServerClient` with cookie get/set/remove. This is the only client bound to the caller's session. Use it for anything acting *as the user* (sign in, sign up, OTP, password reset). `locals.getSession()` is the convenience wrapper.
 2. **`$lib/supabaseClient`** — a module-level anon client with **no session attached**. Used today for `entry_logs` / `invite_logs` inserts and `profiles` reads/writes. Anything written through it runs as anon and depends entirely on permissive RLS — this is why admin checks and audit inserts work without a user JWT.
-3. **`serviceSupabase` (`$lib/utils/serviceSupabase.ts`)** and the ad-hoc `createClient(url, PUBLIC_SUPABASE_SERVICE_KEY)` calls in the admin routes — service role, bypasses RLS. Needed for `auth.admin.*` operations (invite, listUsers, deleteUser) and the `otp_codes` table.
+3. **`serviceSupabase` (`$lib/utils/serviceSupabase.ts`)** and the ad-hoc `createClient(url, PRIVATE_SUPABASE_SERVICE_KEY)` calls in the admin routes — service role, bypasses RLS. Needed for `auth.admin.*` operations (invite, listUsers, deleteUser) and the `otp_codes` table.
 
 Client-side, `src/routes/+layout.ts` builds a `createBrowserClient` with hand-rolled `document.cookie` handling and exposes it as `data.supabase`.
 
@@ -70,18 +79,19 @@ Client-side, `src/routes/+layout.ts` builds a `createBrowserClient` with hand-ro
 
 ### Door control path
 
-`control/+page.server.ts` is the core of the app:
+`control/+page.server.ts` is the core of the app. It never talks to a panel directly: it calls the **door provider** from `getDoorProvider()` in `$lib/server/doors` (selected by `DOOR_PROVIDER`, created once per process, lazily imported so a serverless Inner Range build never loads the Bosch UDP code). The `DoorProvider` interface (`doors/types.ts`) is `doors`, `open(door)`, optional `status()` / `arm()`, and `capabilities` (`status`, `arm`, `autoRelock`) that the page uses to decide whether to show the panel status line, the Arm button and re-lock polling.
 
-1. `inceptionAuthService.authenticate()` POSTs `PRIVATE_INCEPTION_USERNAME`/`PASSWORD` to the Inception login endpoint and caches the returned `UserID` in a **module-level variable with a 10-minute TTL** (`getToken()`). Note: the login URL there is hard-coded with the site serial, while door control uses `PRIVATE_INCEPTION_BASE_URL` — they can drift.
-2. The token is sent to Inception as a `Cookie: LoginSessId=<token>` header on `POST {base}/api/v1/control/door/{id}/activity` with `{ Type: 'ControlDoor', DoorControlType: 'Open' }`.
-3. Both success and failure insert a row into `entry_logs` (user id, email, door name/id, `status` boolean) via the anon client.
+1. `load` returns the provider's door list (`id`, `name`, `icon`) and capabilities.
+2. The `control` action looks the door up **server-side by id** (the client's door name/target is never trusted), runs `checkReportedLocation()`, calls `provider.open(door)`, and writes `entry_logs` for both outcomes via the anon client. `arm` exists only for providers with `arm()`. `GET /control/status` returns live state for providers with `status()`.
+3. **inner-range** (`doors/inner-range.ts`): `inceptionAuthService.authenticate()` POSTs the Inception credentials to `{PRIVATE_INCEPTION_BASE_URL}/api/v1/authentication/login` and caches the returned `UserID` with a 10-minute TTL; the token goes in `Cookie: LoginSessId=<token>` on `POST {base}/api/v1/control/door/{guid}/activity` with `{ Type: 'ControlDoor', DoorControlType: 'Open' }`. Doors come from `DOORS`, else default to the three `DOOR_GUIDS` in `src/lib/common/constants.ts`.
+4. **bosch** (`doors/bosch.ts`): disarms every armed area (verifying it took), pulses the door, and confirms the lock state, all through the single shared panel session in `$lib/server/bosch/manager.ts`. It refuses to start on serverless hosts. Protocol details and gotchas: `docs/BOSCH-INTEGRATION.md`.
 
-Door GUIDs are hard-coded in `src/lib/common/constants.ts` (`DOOR_GUIDS`) and mapped to labels/icons in `control/+page.svelte`.
+`svelte.config.js` picks the adapter from `DOOR_PROVIDER` (`adapter-netlify` for inner-range, `adapter-node` for bosch; `ADAPTER` overrides, and Bosch on Netlify is a build error).
 
-The geofence is enforced in **both** places, and the shared maths lives in `$lib/common/geo.ts`: `calculateDistance`, plus `SITE_MAX_DISTANCE_METRES` and `MAX_LOCATION_ACCURACY_METRES`, which are read from `PUBLIC_SITE_RADIUS_METRES` / `PUBLIC_SITE_MAX_ACCURACY_METRES` so the fence can be tuned per environment without a code change (falling back to 300 m / 100 m on a missing or invalid value). Note the dev `.env` typically points the site coords at a developer's own location, so **the denial path never fires locally** — change a coord to test it.
+The geofence is enforced in **both** places, and the shared maths lives in `$lib/common/geo.ts`: `calculateDistance`, plus `SITE_MAX_DISTANCE_METRES` and `MAX_LOCATION_ACCURACY_METRES`, which are read from `PUBLIC_SITE_RADIUS_METRES` / `PUBLIC_SITE_MAX_ACCURACY_METRES` so the fence can be tuned per environment without a code change (falling back to 300 m / 100 m on a missing or invalid value). Note the dev `.env` typically points the site coords at a developer's own location (or sets `PUBLIC_GEOFENCE_DISABLED=true`), so **the denial path never fires locally** — change a coord to test it.
 
 - `control/+page.svelte` checks proximity on mount to decide whether to render the door buttons, and sends a fresh fix (`latitude`, `longitude`, `accuracy`) with every open request. This half is UX.
-- `checkReportedLocation()` in `control/+page.server.ts` re-runs the check on those reported values and `fail(403)`s before touching Inception. It also rejects vague fixes (`accuracy` > 100 m) and implausible jumps between a user's consecutive reports, tracked in a module-level `Map` (best-effort — empty on cold start, not shared across serverless instances). Denied attempts are written to `entry_logs` with `status: false`.
+- `checkReportedLocation()` in `control/+page.server.ts` re-runs the check on those reported values and `fail(403)`s before touching the door provider. It also rejects vague fixes (`accuracy` > 100 m) and implausible jumps between a user's consecutive reports, tracked in a module-level `Map` (best-effort — empty on cold start, not shared across serverless instances). Denied attempts are written to `entry_logs` with `status: false`.
 
 ⚠️ The browser still supplies the coordinates, so a caller who spoofs their position passes both checks. This raises the cost of a bypass and creates an audit trail; it is **not** proof of presence. Don't describe it as a hard access control — the real boundary is who holds a Supabase account. A network- or hardware-based proximity factor isn't available at this site.
 
